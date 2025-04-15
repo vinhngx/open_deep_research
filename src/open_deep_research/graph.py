@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.constants import Send
 from langgraph.graph import START, END, StateGraph
 from langgraph.types import interrupt, Command
+import pdb
 
 from open_deep_research.state import (
     ReportStateInput,
@@ -36,6 +37,23 @@ from open_deep_research.utils import (
     get_search_params, 
     select_and_execute_search
 )
+
+# init chat model wrapper for llama-nemotron
+def nemotron_init_chat_model(model: str, model_provider: str, base_url: str = None, **kwargs):
+    if model_provider == "llama-nemotron":
+        return init_chat_model(
+            model=model or "nvidia/llama-3.3-nemotron-super-49b-v1",
+            base_url=base_url or "http://localhost:8000/v1",
+            api_key="not-needed",
+            model_provider="nvidia",  # Force OpenAI-compatible API for vLLM
+            **kwargs
+        )
+    else:
+        return init_chat_model(
+            model=model,
+            model_provider=model_provider,
+            **kwargs
+        )
 
 ## Nodes -- 
 
@@ -75,12 +93,13 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
     # Set writer model (model used for query writing)
     writer_provider = get_config_value(configurable.writer_provider)
     writer_model_name = get_config_value(configurable.writer_model)
-    writer_model = init_chat_model(model=writer_model_name, model_provider=writer_provider) 
+    writer_model = nemotron_init_chat_model(model=writer_model_name, model_provider=writer_provider) 
     structured_llm = writer_model.with_structured_output(Queries)
 
     # Format system instructions
     system_instructions_query = report_planner_query_writer_instructions.format(topic=topic, report_organization=report_structure, number_of_queries=number_of_queries)
 
+    #pdb.set_trace()
     # Generate queries  
     results = structured_llm.invoke([SystemMessage(content=system_instructions_query),
                                      HumanMessage(content="Generate search queries that will help with planning the sections of the report.")])
@@ -112,7 +131,7 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
 
     else:
         # With other models, thinking tokens are not specifically allocated
-        planner_llm = init_chat_model(model=planner_model, 
+        planner_llm = nemotron_init_chat_model(model=planner_model, 
                                       model_provider=planner_provider)
     
     # Generate the report sections
@@ -202,7 +221,7 @@ def generate_queries(state: SectionState, config: RunnableConfig):
     # Generate queries 
     writer_provider = get_config_value(configurable.writer_provider)
     writer_model_name = get_config_value(configurable.writer_model)
-    writer_model = init_chat_model(model=writer_model_name, model_provider=writer_provider) 
+    writer_model = nemotron_init_chat_model(model=writer_model_name, model_provider=writer_provider) 
     structured_llm = writer_model.with_structured_output(Queries)
 
     # Format system instructions
@@ -285,7 +304,7 @@ def write_section(state: SectionState, config: RunnableConfig) -> Command[Litera
     # Generate section  
     writer_provider = get_config_value(configurable.writer_provider)
     writer_model_name = get_config_value(configurable.writer_model)
-    writer_model = init_chat_model(model=writer_model_name, model_provider=writer_provider) 
+    writer_model = nemotron_init_chat_model(model=writer_model_name, model_provider=writer_provider) 
 
     section_content = writer_model.invoke([SystemMessage(content=section_writer_instructions),
                                            HumanMessage(content=section_writer_inputs_formatted)])
@@ -314,7 +333,7 @@ def write_section(state: SectionState, config: RunnableConfig) -> Command[Litera
                                            max_tokens=20_000, 
                                            thinking={"type": "enabled", "budget_tokens": 16_000}).with_structured_output(Feedback)
     else:
-        reflection_model = init_chat_model(model=planner_model, 
+        reflection_model = nemotron_init_chat_model(model=planner_model, 
                                            model_provider=planner_provider).with_structured_output(Feedback)
     # Generate feedback
     feedback = reflection_model.invoke([SystemMessage(content=section_grader_instructions_formatted),
@@ -363,7 +382,7 @@ def write_final_sections(state: SectionState, config: RunnableConfig):
     # Generate section  
     writer_provider = get_config_value(configurable.writer_provider)
     writer_model_name = get_config_value(configurable.writer_model)
-    writer_model = init_chat_model(model=writer_model_name, model_provider=writer_provider) 
+    writer_model = nemotron_init_chat_model(model=writer_model_name, model_provider=writer_provider) 
     
     section_content = writer_model.invoke([SystemMessage(content=system_instructions),
                                            HumanMessage(content="Generate a report section based on the provided sources.")])
