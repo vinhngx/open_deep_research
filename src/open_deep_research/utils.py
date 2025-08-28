@@ -33,6 +33,69 @@ from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 
+def get_model_config_for_nvidia(model_name: str, api_key: str = None, **kwargs):
+    """Get model configuration dict that handles NVIDIA models.
+    
+    Args:
+        model_name: Model name (e.g., 'nvidia:nvidia/llama-3.3-nemotron-super-49b-v1' or 'openai:gpt-4')
+        api_key: API key for the model provider
+        **kwargs: Additional configuration parameters
+        
+    Returns:
+        Dictionary with model configuration suitable for .with_config()
+    """
+    config_dict = {
+        "api_key": api_key,
+        **kwargs
+    }
+    
+    if model_name.lower().startswith("nvidia:"):
+        # Extract model name without nvidia prefix
+        nvidia_model_name = model_name.split(":", 1)[1]
+        
+        # Use NVIDIA provider with proper model name and custom base URL
+        config_dict.update({
+            "model": nvidia_model_name,
+            "model_provider": "nvidia",
+            "base_url": "https://integrate.api.nvidia.com/v1"
+        })
+    else:
+        # Use standard configuration for other providers
+        config_dict["model"] = model_name
+    
+    return config_dict
+
+def init_model_with_nvidia_support(model_name: str, api_key: str = None, **kwargs):
+    """Initialize a chat model with NVIDIA NIM support.
+    
+    Args:
+        model_name: Model name (e.g., 'nvidia:nvidia/llama-3.3-nemotron-super-49b-v1' or 'openai:gpt-4')
+        api_key: API key for the model provider
+        **kwargs: Additional arguments to pass to init_chat_model
+        
+    Returns:
+        Initialized chat model
+    """
+    if model_name.lower().startswith("nvidia:"):
+        # Extract model name without nvidia prefix
+        nvidia_model_name = model_name.split(":", 1)[1]
+        
+        # Use NVIDIA provider with proper model name and custom base URL
+        return init_chat_model(
+            model=nvidia_model_name,
+            model_provider="nvidia",
+            api_key=api_key,
+            base_url="https://integrate.api.nvidia.com/v1",
+            **kwargs
+        )
+    else:
+        # Use standard initialization for other providers
+        return init_chat_model(
+            model=model_name,
+            api_key=api_key,
+            **kwargs
+        )
+
 ##########################
 # Tavily Search Tool Utils
 ##########################
@@ -83,10 +146,10 @@ async def tavily_search(
     
     # Initialize summarization model with retry logic
     model_api_key = get_api_key_for_model(configurable.summarization_model, config)
-    summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
+    summarization_model = init_model_with_nvidia_support(
+        model_name=configurable.summarization_model,
         api_key=model_api_key,
+        max_tokens=configurable.summarization_model_max_tokens,
         tags=["langsmith:nostream"]
     ).with_structured_output(Summary).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
@@ -684,6 +747,8 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
             provider = 'anthropic'
         elif model_str.startswith('gemini:') or model_str.startswith('google:'):
             provider = 'gemini'
+        elif model_str.startswith('nvidia:'):
+            provider = 'nvidia'
     
     # Step 2: Check provider-specific token limit patterns
     if provider == 'openai':
@@ -692,12 +757,15 @@ def is_token_limit_exceeded(exception: Exception, model_name: str = None) -> boo
         return _check_anthropic_token_limit(exception, error_str)
     elif provider == 'gemini':
         return _check_gemini_token_limit(exception, error_str)
+    elif provider == 'nvidia':
+        return _check_nvidia_token_limit(exception, error_str)
     
     # Step 3: If provider unknown, check all providers
     return (
         _check_openai_token_limit(exception, error_str) or
         _check_anthropic_token_limit(exception, error_str) or
-        _check_gemini_token_limit(exception, error_str)
+        _check_gemini_token_limit(exception, error_str) or
+        _check_nvidia_token_limit(exception, error_str)
     )
 
 def _check_openai_token_limit(exception: Exception, error_str: str) -> bool:
@@ -784,6 +852,42 @@ def _check_gemini_token_limit(exception: Exception, error_str: str) -> bool:
     
     return False
 
+def _check_nvidia_token_limit(exception: Exception, error_str: str) -> bool:
+    """Check if exception indicates NVIDIA token limit exceeded."""
+    # Analyze exception metadata
+    exception_type = str(type(exception))
+    class_name = exception.__class__.__name__
+    module_name = getattr(exception.__class__, '__module__', '')
+    
+    # Check if this is an OpenAI-compatible exception from NVIDIA API
+    # NVIDIA NIM uses OpenAI-compatible API, so errors may look similar to OpenAI
+    is_nvidia_or_openai_exception = (
+        'nvidia' in exception_type.lower() or 
+        'nvidia' in module_name.lower() or
+        'openai' in exception_type.lower() or
+        'openai' in module_name.lower()
+    )
+    
+    # Check for typical token limit error types
+    is_request_error = class_name in ['BadRequestError', 'InvalidRequestError']
+    
+    if is_nvidia_or_openai_exception and is_request_error:
+        # Look for token-related keywords in error message
+        token_keywords = ['token', 'context', 'length', 'maximum context', 'reduce', 'exceed']
+        if any(keyword in error_str for keyword in token_keywords):
+            return True
+    
+    # Check for specific error codes that might be returned by NVIDIA API
+    if hasattr(exception, 'code') and hasattr(exception, 'type'):
+        error_code = getattr(exception, 'code', '')
+        error_type = getattr(exception, 'type', '')
+        
+        if (error_code == 'context_length_exceeded' or
+            error_type == 'invalid_request_error'):
+            return True
+    
+    return False
+
 # NOTE: This may be out of date or not applicable to your models. Please update this as needed.
 MODEL_TOKEN_LIMITS = {
     "openai:gpt-4.1-mini": 1047576,
@@ -826,6 +930,13 @@ MODEL_TOKEN_LIMITS = {
     "bedrock:us.anthropic.claude-sonnet-4-20250514-v1:0": 200000,
     "bedrock:us.anthropic.claude-opus-4-20250514-v1:0": 200000,
     "anthropic.claude-opus-4-1-20250805-v1:0": 200000,
+    # NVIDIA models
+    "nvidia:nvidia/llama-3.3-nemotron-super-49b-v1": 128000,
+    "nvidia:llama-3.3-nemotron-super-49b-v1": 128000,
+    "nvidia:llama-3.1-nemotron-70b-instruct": 128000,
+    "nvidia:llama-3.1-70b-instruct": 128000,
+    "nvidia:llama-3.1-8b-instruct": 128000,
+    "nvidia:nemotron-4-340b-instruct": 4096,
 }
 
 def get_model_token_limit(model_string):
@@ -865,6 +976,34 @@ def remove_up_to_last_ai_message(messages: list[MessageLikeRepresentation]) -> l
     # No AI messages found, return original list
     return messages
 
+def filter_empty_messages(messages: list[MessageLikeRepresentation]) -> list[MessageLikeRepresentation]:
+    """Remove messages with empty or whitespace-only content.
+    
+    NVIDIA API requires all messages to have non-empty content.
+    
+    Args:
+        messages: List of message objects to filter
+        
+    Returns:
+        Filtered list with empty messages removed
+    """
+    filtered_messages = []
+    for message in messages:
+        # Handle both dict format and message objects
+        if isinstance(message, dict):
+            content = message.get('content', '')
+        elif hasattr(message, 'content'):
+            content = message.content
+        else:
+            # If we can't find content, skip this message
+            continue
+            
+        # Check if content is not empty/whitespace-only
+        if isinstance(content, str) and content.strip():
+            filtered_messages.append(message)
+    
+    return filtered_messages
+
 ##########################
 # Misc Utils
 ##########################
@@ -875,7 +1014,7 @@ def get_today_str() -> str:
     Returns:
         Human-readable date string in format like 'Mon Jan 15, 2024'
     """
-    now = datetime.datetime.now()
+    now = datetime.now()
     return f"{now:%a} {now:%b} {now.day}, {now:%Y}"
 
 def get_config_value(value):
@@ -903,6 +1042,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return api_keys.get("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return api_keys.get("GOOGLE_API_KEY")
+        elif model_name.startswith("nvidia:"):
+            return api_keys.get("NVIDIA_API_KEY")
         return None
     else:
         if model_name.startswith("openai:"): 
@@ -911,6 +1052,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):
             return os.getenv("GOOGLE_API_KEY")
+        elif model_name.startswith("nvidia:"):
+            return os.getenv("NVIDIA_API_KEY")
         return None
 
 def get_tavily_api_key(config: RunnableConfig):
